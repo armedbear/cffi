@@ -69,8 +69,6 @@
    #:native-namestring
    #:%mem-ref
    #:%mem-set
-   ;; #:make-shareable-byte-vector
-   ;; #:with-pointer-to-vector-data
    #:%foreign-symbol-pointer
    #:%defcallback
    #:%callback
@@ -291,10 +289,27 @@ supplied, it will be bound to SIZE during BODY."
     (:pointer "getPointer")
     ((:short :unsigned-short) "getShort")))
 
+;;; HACK for now: keep track of all the pointers hashed by the
+;;; shareable byte vectors we allocate.
+(defvar *static-vector-pointer*
+  (make-hash-table :weakness :value))
+
 (defun make-shareable-byte-vector (size)
   "Create a Lisp vector of SIZE bytes can passed to
 WITH-POINTER-TO-VECTOR-DATA."
-  (make-array size :element-type '(unsigned-byte 8)))
+  (if (fboundp 'ext:make-bytebuffer-byte-vector) ;; abcl-1.6.2-dev, upcoming abcl-1.7.0
+      (let* ((heap-pointer
+              (jss:new "com.sun.jna.Memory" size))
+             (bytebuffer
+              (#"getByteBuffer" heap-pointer 0 size))
+             (result
+              (ext:make-bytebuffer-byte-vector bytebuffer)))
+        (setf (gethash result *static-vector-pointer*)
+              heap-pointer)
+        (values
+         result
+         heap-pointer))
+      (make-array size :element-type '(unsigned-byte 8))))
 
 (let ((method (jmethod "com.sun.jna.Pointer"
                        (jna-setter :char) "long" (jna-setter-arg-type :char))))
@@ -314,13 +329,17 @@ WITH-POINTER-TO-VECTOR-DATA."
 
 (defmacro with-pointer-to-vector-data ((ptr-var vector) &body body)
   "Bind PTR-VAR to a foreign pointer to the data in VECTOR."
-  (let ((vector-sym (gensym "VECTOR")))
-    `(let ((,vector-sym ,vector))
-       (with-foreign-pointer (,ptr-var (length ,vector-sym))
-         (copy-to-foreign-vector ,vector-sym ,ptr-var)
-         (unwind-protect
-              (progn ,@body)
-           (copy-from-foreign-vector ,vector-sym ,ptr-var))))))
+  (let ((vector-sym (gensym "VECTOR"))
+        (heap-pointer (gethash vector *static-vector-pointer*)))
+    (if heap-pointer
+        `(let ((,ptr-var ,heap-pointer))
+           (progn ,@body))
+        `(let ((,vector-sym ,vector))
+           (with-foreign-pointer (,ptr-var (length ,vector-sym))
+             (copy-to-foreign-vector ,vector-sym ,ptr-var)
+             (unwind-protect
+                  (progn ,@body)
+               (copy-from-foreign-vector ,vector-sym ,ptr-var)))))))
 
 ;;;# Dereferencing
 
